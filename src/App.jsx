@@ -1,4 +1,19 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { 
+  getFirebaseAuth, 
+  getFirebaseDb, 
+  isInitialized, 
+  initializeFirebase, 
+  clearFirebaseConfig 
+} from "./firebase";
+import { 
+  onAuthStateChanged, 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword, 
+  signOut 
+} from "firebase/auth";
+import { doc, onSnapshot, setDoc } from "firebase/firestore";
+
 
 // ─── FULL QUEST DATABASE (100 levels, 4 quests each) ─────────────────────────
 const ALL_QUESTS = {
@@ -674,6 +689,7 @@ const INIT_STATE = {
   completedLevels: [],
   penalties: 0,
   log: [],
+  updatedAt: 0,
 };
 
 function computeXPRequired(level) {
@@ -683,7 +699,13 @@ function computeXPRequired(level) {
 function reducer(state, action) {
   const ts = new Date().toLocaleTimeString("en-IN",{hour:"2-digit",minute:"2-digit"});
   switch(action.type) {
-    case "START": return { ...state, screen:"game" };
+    case "LOAD_STATE": {
+      return {
+        ...state,
+        ...action.payload,
+      };
+    }
+    case "START": return { ...state, screen:"game", updatedAt: Date.now() };
     case "TOGGLE_QUEST": {
       const { qid, xp, stat, done } = action;
       const newQuests = { ...state.completedQuests };
@@ -710,25 +732,33 @@ function reducer(state, action) {
         xp: Math.max(0, state.xp + dxp),
         totalXP: Math.max(0, state.totalXP + dxp),
         log: [...state.log.slice(-49), { msg, color: done?"#555":"#4ade80", ts }],
+        updatedAt: Date.now(),
       };
     }
     case "LEVEL_UP": {
       return { ...state, screen:"levelup", completedLevels:[...state.completedLevels, state.level],
-        log:[...state.log.slice(-49),{msg:`⚡ LEVEL ${state.level} CLEARED.`,color:"#00e5ff",ts}] };
+        log:[...state.log.slice(-49),{msg:`⚡ LEVEL ${state.level} CLEARED.`,color:"#00e5ff",ts}],
+        updatedAt: Date.now(),
+      };
     }
     case "ADVANCE": {
       const next = state.level + 1;
-      if (next > 100) return { ...state, screen:"win" };
+      if (next > 100) return { ...state, screen:"win", updatedAt: Date.now() };
       return { ...state, screen:"game", level:next, xp:0,
-        log:[...state.log.slice(-49),{msg:`Level ${next} quest log activated.`,color:"#fbbf24",ts}] };
+        log:[...state.log.slice(-49),{msg:`Level ${next} quest log activated.`,color:"#fbbf24",ts}],
+        updatedAt: Date.now(),
+      };
     }
     case "PENALTY": {
       return { ...state, penalties: state.penalties+1,
-        log:[...state.log.slice(-49),{msg:`⚠ PENALTY: ${action.label}`,color:"#ff4444",ts}] };
+        log:[...state.log.slice(-49),{msg:`⚠ PENALTY: ${action.label}`,color:"#ff4444",ts}],
+        updatedAt: Date.now(),
+      };
     }
     default: return state;
   }
 }
+
 
 // ─── COMPONENTS ───────────────────────────────────────────────────────────────
 function SBar({ stat, value, size="md" }) {
@@ -847,7 +877,7 @@ function WinScreen({ totalXP }) {
 }
 
 // ─── MAIN GAME ────────────────────────────────────────────────────────────────
-function GameScreen({ state, dispatch }) {
+function GameScreen({ state, dispatch, user, syncing, onOpenSyncModal }) {
   const [tab, setTab] = useState("quests");
   const [penModal, setPenModal] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
@@ -890,12 +920,36 @@ function GameScreen({ state, dispatch }) {
             <div style={{height:"100%",width:`${xpPct}%`,background:"linear-gradient(90deg,#0055ff,#00e5ff)",transition:"width .7s ease"}}/>
           </div>
         </div>
-        <div style={{display:"flex",gap:6,marginLeft:"auto"}}>
+        <div style={{display:"flex",gap:6,marginLeft:"auto",alignItems:"center"}}>
           {isBoss && <div style={{padding:"3px 8px",background:"#ff000018",border:"1px solid #ff333333",borderRadius:4,fontFamily:"monospace",fontSize:8,color:"#ff4444"}}>⚠ BOSS</div>}
+          
+          {/* Cloud Sync Status Badge */}
+          <button 
+            onClick={onOpenSyncModal} 
+            style={{
+              padding:"4px 10px",
+              background: user ? "rgba(0, 229, 255, 0.08)" : "rgba(255, 255, 255, 0.04)",
+              border: user ? "1px solid rgba(0, 229, 255, 0.3)" : "1px solid rgba(255, 255, 255, 0.1)",
+              borderRadius:4,
+              color: user ? "#00e5ff" : "#888",
+              fontFamily:"monospace",
+              fontSize:8,
+              cursor:"pointer",
+              display:"flex",
+              alignItems:"center",
+              gap:4,
+              transition:"all 0.2s"
+            }}
+          >
+            <span style={{fontSize: 10}}>{syncing ? "⏳" : user ? "☁️" : "☁️❌"}</span>
+            <span>{syncing ? "SYNCING..." : user ? "CLOUD SYNC" : "CONNECT SYNC"}</span>
+          </button>
+
           <button onClick={()=>setLogOpen(!logOpen)} style={{padding:"4px 10px",background:"#ffffff08",border:"1px solid #ffffff15",borderRadius:4,color:"#666",fontFamily:"monospace",fontSize:8,cursor:"pointer"}}>LOG</button>
           <button onClick={()=>setPenModal(true)} style={{padding:"4px 10px",background:"#ff00000a",border:"1px solid #ff222222",borderRadius:4,color:"#ff5555",fontFamily:"monospace",fontSize:8,cursor:"pointer"}}>PENALTY</button>
         </div>
       </div>
+
 
       <div style={{background:isBoss?"#0d0005":"#02020d",borderBottom:"1px solid #ffffff08",padding:"7px 18px",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0}}>
         <div>
@@ -1117,10 +1171,335 @@ function GameScreen({ state, dispatch }) {
 
 // ─── ROOT ─────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [state, setState] = useState(INIT_STATE);
+  const [state, setState] = useState(() => {
+    try {
+      const saved = localStorage.getItem("sl_player_state");
+      if (saved) {
+        return { ...INIT_STATE, ...JSON.parse(saved) };
+      }
+    } catch (e) {
+      console.error("Failed to load initial state from localStorage", e);
+    }
+    return INIT_STATE;
+  });
+
   const dispatch = useCallback(action => setState(prev => reducer(prev, action)), []);
   const isBoss = state.level % 10 === 0;
   const arcData = ARC_DATA[Math.ceil(state.level/10)-1];
+
+  // Firebase Sync State
+  const [user, setUser] = useState(null);
+  const [firebaseInitialized, setFirebaseInitialized] = useState(isInitialized());
+  const [firebaseError, setFirebaseError] = useState(null);
+  const [syncing, setSyncing] = useState(false);
+  const [conflictData, setConflictData] = useState(null);
+  const [syncModalOpen, setSyncModalOpen] = useState(false);
+
+  // Authentication Fields
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [authMode, setAuthMode] = useState("login"); // "login" | "register"
+  const [configInput, setConfigInput] = useState("");
+
+  const lastCloudUpdatedAt = useRef(0);
+  const unsubFirestore = useRef(null);
+
+  // Save state to localStorage
+  useEffect(() => {
+    localStorage.setItem("sl_player_state", JSON.stringify(state));
+  }, [state]);
+
+  // Auth State Listener
+  useEffect(() => {
+    if (!firebaseInitialized) return;
+    
+    try {
+      const auth = getFirebaseAuth();
+      if (!auth) return;
+      
+      const unsubAuth = onAuthStateChanged(auth, (currentUser) => {
+        setUser(currentUser);
+        if (!currentUser) {
+          if (unsubFirestore.current) {
+            unsubFirestore.current();
+            unsubFirestore.current = null;
+          }
+        }
+      });
+      
+      return () => unsubAuth();
+    } catch (err) {
+      console.error("Error setting up auth listener:", err);
+    }
+  }, [firebaseInitialized]);
+
+  // Firestore Sync Listener
+  useEffect(() => {
+    if (!firebaseInitialized || !user) {
+      if (unsubFirestore.current) {
+        unsubFirestore.current();
+        unsubFirestore.current = null;
+      }
+      return;
+    }
+
+    try {
+      const db = getFirebaseDb();
+      if (!db) return;
+
+      const docRef = doc(db, "users", user.uid);
+      setSyncing(true);
+
+      unsubFirestore.current = onSnapshot(docRef, (docSnap) => {
+        setSyncing(false);
+        if (docSnap.exists()) {
+          const cloudState = docSnap.data();
+          const cloudUpdatedAt = cloudState.updatedAt || 0;
+          const localSaved = JSON.parse(localStorage.getItem("sl_player_state") || "{}");
+          const localUpdatedAt = localSaved.updatedAt || 0;
+
+          lastCloudUpdatedAt.current = cloudUpdatedAt;
+
+          if (cloudUpdatedAt > localUpdatedAt) {
+            // Cloud is newer
+            const localQuestsCount = Object.keys(localSaved.completedQuests || {}).length;
+            const cloudQuestsCount = Object.keys(cloudState.completedQuests || {}).length;
+
+            if (localUpdatedAt > 0 && 
+                (localSaved.level !== cloudState.level || localQuestsCount !== cloudQuestsCount) && 
+                !localStorage.getItem(`sl_sync_resolved_${user.uid}`)) {
+              setConflictData(cloudState);
+            } else {
+              dispatch({ type: "LOAD_STATE", payload: cloudState });
+              localStorage.setItem("sl_player_state", JSON.stringify(cloudState));
+            }
+          } else if (localUpdatedAt > cloudUpdatedAt) {
+            // Local is newer
+            setDoc(docRef, { ...localSaved, updatedAt: localUpdatedAt }, { merge: true })
+              .catch(err => console.error("Auto Sync upload failed:", err));
+          }
+        } else {
+          // Cloud doc does not exist, initialize with local state
+          const localSaved = JSON.parse(localStorage.getItem("sl_player_state") || "{}");
+          const now = Date.now();
+          setDoc(docRef, { ...localSaved, updatedAt: now }, { merge: true })
+            .then(() => {
+              lastCloudUpdatedAt.current = now;
+              dispatch({ type: "LOAD_STATE", payload: { updatedAt: now } });
+            })
+            .catch(err => console.error("Cloud document seed failed:", err));
+        }
+      }, (err) => {
+        console.error("Firestore snapshot error:", err);
+        setSyncing(false);
+      });
+
+      return () => {
+        if (unsubFirestore.current) {
+          unsubFirestore.current();
+          unsubFirestore.current = null;
+        }
+      };
+    } catch (err) {
+      console.error("Error setting up Firestore listener:", err);
+      setSyncing(false);
+    }
+  }, [firebaseInitialized, user]);
+
+  // Sync Local State Changes to Firestore
+  useEffect(() => {
+    if (!firebaseInitialized || !user || !state.updatedAt) return;
+
+    if (state.updatedAt > lastCloudUpdatedAt.current) {
+      const db = getFirebaseDb();
+      if (!db) return;
+
+      const docRef = doc(db, "users", user.uid);
+      setSyncing(true);
+
+      setDoc(docRef, state, { merge: true })
+        .then(() => {
+          lastCloudUpdatedAt.current = state.updatedAt;
+          setSyncing(false);
+        })
+        .catch(err => {
+          console.error("Failed to upload state to Firestore:", err);
+          setSyncing(false);
+        });
+    }
+  }, [state, user, firebaseInitialized]);
+
+  // Conflict Resolvers
+  const handleKeepLocal = async () => {
+    if (!user) return;
+    const db = getFirebaseDb();
+    if (!db) return;
+    const docRef = doc(db, "users", user.uid);
+    const now = Date.now();
+    const localStateWithTime = { ...state, updatedAt: now };
+
+    setSyncing(true);
+    try {
+      await setDoc(docRef, localStateWithTime, { merge: true });
+      lastCloudUpdatedAt.current = now;
+      dispatch({ type: "LOAD_STATE", payload: { updatedAt: now } });
+      localStorage.setItem(`sl_sync_resolved_${user.uid}`, "true");
+      setConflictData(null);
+    } catch (err) {
+      console.error("Keep local failed:", err);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const handleUseCloud = () => {
+    if (!conflictData || !user) return;
+    dispatch({ type: "LOAD_STATE", payload: conflictData });
+    lastCloudUpdatedAt.current = conflictData.updatedAt || 0;
+    localStorage.setItem("sl_player_state", JSON.stringify(conflictData));
+    localStorage.setItem(`sl_sync_resolved_${user.uid}`, "true");
+    setConflictData(null);
+  };
+
+  const handleMergeStates = async () => {
+    if (!user || !conflictData) return;
+    const db = getFirebaseDb();
+    if (!db) return;
+    const docRef = doc(db, "users", user.uid);
+
+    const mergedQuests = { ...state.completedQuests, ...conflictData.completedQuests };
+    const mergedLevels = Array.from(new Set([...state.completedLevels, ...(conflictData.completedLevels || [])]));
+
+    const mergedStats = {};
+    const statsKeys = ["STR", "AGI", "INT", "WIS", "GLD"];
+    statsKeys.forEach(k => {
+      mergedStats[k] = Math.max(state.stats[k] || 0, conflictData.stats?.[k] || 0);
+    });
+
+    const mergedLevel = Math.max(state.level, conflictData.level);
+    let mergedXP = 0;
+    if (state.level > conflictData.level) {
+      mergedXP = state.xp;
+    } else if (conflictData.level > state.level) {
+      mergedXP = conflictData.xp;
+    } else {
+      mergedXP = Math.max(state.xp, conflictData.xp);
+    }
+
+    const mergedTotalXP = Math.max(state.totalXP, conflictData.totalXP || 0);
+    const mergedPenalties = Math.max(state.penalties, conflictData.penalties || 0);
+    const mergedLog = [...state.log, ...(conflictData.log || [])].slice(-50);
+
+    const now = Date.now();
+    const mergedState = {
+      ...state,
+      level: mergedLevel,
+      xp: mergedXP,
+      totalXP: mergedTotalXP,
+      stats: mergedStats,
+      completedQuests: mergedQuests,
+      completedLevels: mergedLevels,
+      penalties: mergedPenalties,
+      log: mergedLog,
+      updatedAt: now
+    };
+
+    setSyncing(true);
+    try {
+      await setDoc(docRef, mergedState, { merge: true });
+      lastCloudUpdatedAt.current = now;
+      dispatch({ type: "LOAD_STATE", payload: mergedState });
+      localStorage.setItem("sl_player_state", JSON.stringify(mergedState));
+      localStorage.setItem(`sl_sync_resolved_${user.uid}`, "true");
+      setConflictData(null);
+    } catch (err) {
+      console.error("Merge states failed:", err);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const handleAuthSubmit = async (e) => {
+    e.preventDefault();
+    setFirebaseError(null);
+    setSyncing(true);
+    try {
+      const auth = getFirebaseAuth();
+      if (!auth) throw new Error("Firebase Auth is not initialized");
+
+      if (authMode === "login") {
+        await signInWithEmailAndPassword(auth, email, password);
+      } else {
+        await createUserWithEmailAndPassword(auth, email, password);
+      }
+      setEmail("");
+      setPassword("");
+    } catch (err) {
+      console.error("Auth action failed:", err);
+      let errMsg = err.message;
+      if (err.code === "auth/invalid-credential") errMsg = "Invalid email or password.";
+      else if (err.code === "auth/email-already-in-use") errMsg = "Email is already linked to a player.";
+      else if (err.code === "auth/weak-password") errMsg = "Password must be at least 6 characters.";
+      setFirebaseError(errMsg);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    setFirebaseError(null);
+    setSyncing(true);
+    try {
+      const auth = getFirebaseAuth();
+      if (auth) {
+        if (user) {
+          localStorage.removeItem(`sl_sync_resolved_${user.uid}`);
+        }
+        await signOut(auth);
+      }
+    } catch (err) {
+      console.error("Sign out failed:", err);
+      setFirebaseError(err.message);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const handleConfigSubmit = (e) => {
+    e.preventDefault();
+    setFirebaseError(null);
+    try {
+      let jsonStr = configInput.trim();
+      
+      if (jsonStr.includes("firebaseConfig = {")) {
+        const start = jsonStr.indexOf("firebaseConfig = {") + 17;
+        const end = jsonStr.indexOf("};", start) + 1;
+        jsonStr = jsonStr.slice(start, end);
+        jsonStr = jsonStr.replace(/([a-zA-Z0-9]+):/g, '"$1":').replace(/'/g, '"');
+      }
+
+      const config = JSON.parse(jsonStr);
+      const res = initializeFirebase(config);
+      if (res.initialized) {
+        setFirebaseInitialized(true);
+        setFirebaseError(null);
+        setConfigInput("");
+      } else {
+        setFirebaseError(res.error || "Failed to initialize Firebase with the config provided.");
+      }
+    } catch (err) {
+      console.error("Config parsing error", err);
+      setFirebaseError("Failed to parse config. Please make sure you are pasting a valid JSON object e.g. {\"apiKey\": \"...\", \"projectId\": \"...\"}");
+    }
+  };
+
+  const handleClearConfig = () => {
+    clearFirebaseConfig();
+    setFirebaseInitialized(false);
+    setUser(null);
+    setFirebaseError(null);
+  };
+
   return (
     <>
       <style>{`
@@ -1133,9 +1512,191 @@ export default function App() {
         button:hover{filter:brightness(1.15)}
       `}</style>
       {state.screen==="boot"    && <BootScreen onStart={()=>dispatch({type:"START"})}/>}
-      {state.screen==="game"    && <GameScreen state={state} dispatch={dispatch}/>}
+      {state.screen==="game"    && (
+        <GameScreen 
+          state={state} 
+          dispatch={dispatch} 
+          user={user}
+          syncing={syncing}
+          onOpenSyncModal={() => setSyncModalOpen(true)}
+        />
+      )}
       {state.screen==="levelup" && <LevelUpScreen level={state.level} isBoss={isBoss} arcName={arcData?.title} onContinue={()=>dispatch({type:"ADVANCE"})}/>}
       {state.screen==="win"     && <WinScreen totalXP={state.totalXP}/>}
+
+      {/* Sync Management Modal */}
+      {syncModalOpen && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.85)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:150,padding:20,backdropFilter:"blur(5px)"}}>
+          <div style={{background:"#040412",border:"1px solid #00e5ff33",borderRadius:8,padding:28,maxWidth:440,width:"100%",boxShadow:"0 0 30px rgba(0,229,255,0.15)"}}>
+            
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+              <div>
+                <span style={{fontFamily:"monospace",fontSize:9,color:"#00e5ff55",letterSpacing:2}}>SYSTEM LINK</span>
+                <h3 style={{fontFamily:"monospace",fontSize:20,color:"#fff",fontWeight:900,letterSpacing:2}}>CLOUD GATE</h3>
+              </div>
+              <button onClick={() => setSyncModalOpen(false)} style={{background:"none",border:"none",color:"#666",cursor:"pointer",fontSize:18}}>✕</button>
+            </div>
+
+            {/* Error Message */}
+            {firebaseError && (
+              <div style={{padding:10,background:"rgba(255,34,34,0.1)",border:"1px solid rgba(255,34,34,0.3)",borderRadius:5,color:"#ff5555",fontSize:11,fontFamily:"monospace",lineHeight:1.4,marginBottom:16}}>
+                ⚠ {firebaseError}
+              </div>
+            )}
+
+            {/* Content based on configuration and Auth status */}
+            {!firebaseInitialized ? (
+              // 1. Firebase Config Setup
+              <form onSubmit={handleConfigSubmit}>
+                <div style={{fontSize:12,color:"#aaa",lineHeight:1.6,fontFamily:"monospace",marginBottom:14}}>
+                  Firebase is not configured. Please paste your Firebase Web App configuration JSON or script snippet to activate the Cloud Gate:
+                </div>
+                <textarea
+                  value={configInput}
+                  onChange={(e) => setConfigInput(e.target.value)}
+                  placeholder='{"apiKey": "AIzaSy...", "authDomain": "...", "projectId": "...", ...}'
+                  style={{width:"100%",height:110,background:"#02020a",border:"1px solid #ffffff15",borderRadius:5,padding:10,color:"#00e5ff",fontFamily:"monospace",fontSize:10,resize:"none",marginBottom:16,outline:"none"}}
+                  required
+                />
+                <button type="submit" style={{width:"100%",padding:"12px",background:"linear-gradient(135deg,#0055ff,#00e5ff)",border:"none",borderRadius:6,fontFamily:"monospace",fontSize:12,color:"#000",fontWeight:700,letterSpacing:2,cursor:"pointer"}}>
+                  INITIALIZE GATE
+                </button>
+                <div style={{fontSize:9,color:"#444",marginTop:10,textAlign:"center",fontFamily:"monospace"}}>
+                  Credentials can also be set via .env files for local hosting.
+                </div>
+              </form>
+            ) : !user ? (
+              // 2. Authentication Form
+              <form onSubmit={handleAuthSubmit}>
+                <div style={{fontSize:12,color:"#aaa",lineHeight:1.6,fontFamily:"monospace",marginBottom:16}}>
+                  Firebase activated. Establish a system link to synchronize your player state across all platforms.
+                </div>
+                
+                <div style={{marginBottom:12}}>
+                  <label style={{display:"block",fontFamily:"monospace",fontSize:9,color:"#00e5ff88",marginBottom:4}}>PLAYER EMAIL</label>
+                  <input
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    style={{width:"100%",padding:10,background:"#02020a",border:"1px solid #ffffff15",borderRadius:5,color:"#fff",fontSize:12,outline:"none"}}
+                    required
+                  />
+                </div>
+
+                <div style={{marginBottom:18}}>
+                  <label style={{display:"block",fontFamily:"monospace",fontSize:9,color:"#00e5ff88",marginBottom:4}}>ACCESS KEY (PASSWORD)</label>
+                  <input
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    style={{width:"100%",padding:10,background:"#02020a",border:"1px solid #ffffff15",borderRadius:5,color:"#fff",fontSize:12,outline:"none"}}
+                    required
+                  />
+                </div>
+
+                <div style={{display:"flex",gap:10,marginBottom:18}}>
+                  <button 
+                    type="submit" 
+                    onClick={() => setAuthMode("login")}
+                    style={{flex:1,padding:"11px",background:authMode==="login"?"#00e5ff":"transparent",border:authMode==="login"?"none":"1px solid rgba(0,229,255,0.3)",borderRadius:5,fontFamily:"monospace",fontSize:11,color:authMode==="login"?"#000":"#00e5ff",fontWeight:700,cursor:"pointer",letterSpacing:1}}
+                  >
+                    LOG IN
+                  </button>
+                  <button 
+                    type="submit" 
+                    onClick={() => setAuthMode("register")}
+                    style={{flex:1,padding:"11px",background:authMode==="register"?"#00e5ff":"transparent",border:authMode==="register"?"none":"1px solid rgba(0,229,255,0.3)",borderRadius:5,fontFamily:"monospace",fontSize:11,color:authMode==="register"?"#000":"#00e5ff",fontWeight:700,cursor:"pointer",letterSpacing:1}}
+                  >
+                    CREATE LINK
+                  </button>
+                </div>
+
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",borderTop:"1px solid #ffffff0a",paddingTop:14}}>
+                  <button type="button" onClick={handleClearConfig} style={{background:"none",border:"none",color:"#555",fontFamily:"monospace",fontSize:9,cursor:"pointer",textDecoration:"underline"}}>
+                    Clear Firebase Settings
+                  </button>
+                </div>
+              </form>
+            ) : (
+              // 3. Synced / Logged In State
+              <div>
+                <div style={{padding:"14px",background:"rgba(0,229,255,0.04)",border:"1px solid rgba(0,229,255,0.15)",borderRadius:6,marginBottom:20}}>
+                  <div style={{fontFamily:"monospace",fontSize:9,color:"#00e5ff88",marginBottom:2}}>STATUS</div>
+                  <div style={{fontFamily:"monospace",fontSize:14,color:"#4ade80",fontWeight:700,display:"flex",alignItems:"center",gap:6}}>
+                    ● LINKED TO CLOUD
+                  </div>
+                  
+                  <div style={{fontFamily:"monospace",fontSize:9,color:"#00e5ff88",marginTop:12,marginBottom:2}}>ACTIVE PLAYER</div>
+                  <div style={{fontFamily:"monospace",fontSize:12,color:"#fff",wordBreak:"break-all"}}>{user.email}</div>
+                  
+                  <div style={{fontFamily:"monospace",fontSize:9,color:"#00e5ff88",marginTop:12,marginBottom:2}}>LAST CLOUD SYNC</div>
+                  <div style={{fontFamily:"monospace",fontSize:11,color:"#aaa"}}>
+                    {state.updatedAt ? new Date(state.updatedAt).toLocaleString("en-IN") : "Never"}
+                  </div>
+                </div>
+
+                <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                  <button onClick={handleSignOut} style={{width:"100%",padding:"11px",background:"#ff444415",border:"1px solid #ff444433",borderRadius:6,color:"#ff4444",fontFamily:"monospace",fontSize:11,fontWeight:700,letterSpacing:2,cursor:"pointer"}}>
+                    SEVER SYSTEM LINK (LOGOUT)
+                  </button>
+                  <button onClick={handleClearConfig} style={{width:"100%",padding:"9px",background:"none",border:"none",color:"#444",fontFamily:"monospace",fontSize:9,cursor:"pointer",textDecoration:"underline"}}>
+                    Modify Configuration settings
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Conflict Resolver Modal */}
+      {conflictData && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.92)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200,padding:20,backdropFilter:"blur(8px)"}}>
+          <div style={{background:"#060618",border:"1px solid rgba(255,215,0,0.3)",borderRadius:8,padding:28,maxWidth:480,width:"100%",boxShadow:"0 0 40px rgba(255,215,0,0.1)"}}>
+            <div style={{fontFamily:"monospace",fontSize:22,color:"#ffd700",fontWeight:900,letterSpacing:2,marginBottom:8}}>SYNC CONFLICT DETECTED</div>
+            <div style={{fontFamily:"monospace",fontSize:11,color:"#888",lineHeight:1.6,marginBottom:20}}>
+              The System has found differing player progress on this device and the Cloud. Select a resolution path:
+            </div>
+            
+            <div style={{display:"flex",flexDirection:"column",gap:12,marginBottom:24}}>
+              {/* Local Data Card */}
+              <div style={{padding:12,background:"rgba(0,229,255,0.03)",border:"1px solid rgba(0,229,255,0.15)",borderRadius:6}}>
+                <div style={{fontFamily:"monospace",fontSize:11,color:"#00e5ff",fontWeight:700,marginBottom:4}}>LOCAL STATE (THIS DEVICE)</div>
+                <div style={{fontSize:10,color:"#ccc",fontFamily:"monospace",lineHeight:1.4}}>
+                  Level {state.level} | XP {state.xp} / {computeXPRequired(state.level)}<br/>
+                  Stats: STR {state.stats?.STR || 0} | INT {state.stats?.INT || 0} | WIS {state.stats?.WIS || 0}<br/>
+                  Completed Quests: {Object.keys(state.completedQuests || {}).length}<br/>
+                  Last Active: {state.updatedAt ? new Date(state.updatedAt).toLocaleString("en-IN") : "Unknown"}
+                </div>
+              </div>
+              
+              {/* Cloud Data Card */}
+              <div style={{padding:12,background:"rgba(251,191,36,0.03)",border:"1px solid rgba(251,191,36,0.15)",borderRadius:6}}>
+                <div style={{fontFamily:"monospace",fontSize:11,color:"#fbbf24",fontWeight:700,marginBottom:4}}>CLOUD STATE (REMOTE GATE)</div>
+                <div style={{fontSize:10,color:"#ccc",fontFamily:"monospace",lineHeight:1.4}}>
+                  Level {conflictData.level} | XP {conflictData.xp} / {computeXPRequired(conflictData.level)}<br/>
+                  Stats: STR {conflictData.stats?.STR || 0} | INT {conflictData.stats?.INT || 0} | WIS {conflictData.stats?.WIS || 0}<br/>
+                  Completed Quests: {Object.keys(conflictData.completedQuests || {}).length}<br/>
+                  Last Active: {conflictData.updatedAt ? new Date(conflictData.updatedAt).toLocaleString("en-IN") : "Unknown"}
+                </div>
+              </div>
+            </div>
+            
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              <button onClick={handleKeepLocal} style={{padding:"12px",background:"#00e5ff",border:"none",borderRadius:6,fontFamily:"monospace",fontSize:11,color:"#000",fontWeight:700,cursor:"pointer",letterSpacing:1}}>
+                OVERWRITE CLOUD WITH LOCAL DATA
+              </button>
+              <button onClick={handleUseCloud} style={{padding:"12px",background:"#fbbf24",border:"none",borderRadius:6,fontFamily:"monospace",fontSize:11,color:"#000",fontWeight:700,cursor:"pointer",letterSpacing:1}}>
+                OVERWRITE LOCAL WITH CLOUD DATA
+              </button>
+              <button onClick={handleMergeStates} style={{padding:"12px",background:"#4ade80",border:"none",borderRadius:6,fontFamily:"monospace",fontSize:11,color:"#000",fontWeight:700,cursor:"pointer",letterSpacing:1}}>
+                MERGE AND INTEGRATE BOTH RECORDS
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
+
