@@ -2,17 +2,15 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { 
   getFirebaseAuth, 
   getFirebaseDb, 
-  isInitialized, 
-  initializeFirebase, 
-  clearFirebaseConfig 
+  googleProvider 
 } from "./firebase";
 import { 
   onAuthStateChanged, 
-  signInWithEmailAndPassword, 
-  createUserWithEmailAndPassword, 
+  signInWithPopup, 
   signOut 
 } from "firebase/auth";
 import { doc, onSnapshot, setDoc } from "firebase/firestore";
+
 
 
 // ─── FULL QUEST DATABASE (100 levels, 4 quests each) ─────────────────────────
@@ -1189,17 +1187,12 @@ export default function App() {
 
   // Firebase Sync State
   const [user, setUser] = useState(null);
-  const [firebaseInitialized, setFirebaseInitialized] = useState(isInitialized());
+  const firebaseInitialized = true;
   const [firebaseError, setFirebaseError] = useState(null);
   const [syncing, setSyncing] = useState(false);
   const [conflictData, setConflictData] = useState(null);
   const [syncModalOpen, setSyncModalOpen] = useState(false);
 
-  // Authentication Fields
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [authMode, setAuthMode] = useState("login"); // "login" | "register"
-  const [configInput, setConfigInput] = useState("");
 
   const lastCloudUpdatedAt = useRef(0);
   const unsubFirestore = useRef(null);
@@ -1419,27 +1412,21 @@ export default function App() {
     }
   };
 
-  const handleAuthSubmit = async (e) => {
-    e.preventDefault();
+  const handleGoogleSignIn = async () => {
     setFirebaseError(null);
     setSyncing(true);
     try {
       const auth = getFirebaseAuth();
       if (!auth) throw new Error("Firebase Auth is not initialized");
-
-      if (authMode === "login") {
-        await signInWithEmailAndPassword(auth, email, password);
-      } else {
-        await createUserWithEmailAndPassword(auth, email, password);
-      }
-      setEmail("");
-      setPassword("");
+      await signInWithPopup(auth, googleProvider);
     } catch (err) {
-      console.error("Auth action failed:", err);
+      console.error("Google sign-in failed:", err);
       let errMsg = err.message;
-      if (err.code === "auth/invalid-credential") errMsg = "Invalid email or password.";
-      else if (err.code === "auth/email-already-in-use") errMsg = "Email is already linked to a player.";
-      else if (err.code === "auth/weak-password") errMsg = "Password must be at least 6 characters.";
+      if (err.code === "auth/popup-closed-by-user") {
+        errMsg = "Sign-in popup closed before completion.";
+      } else if (err.code === "auth/operation-not-allowed") {
+        errMsg = "Google sign-in provider is not enabled in Firebase Console.";
+      }
       setFirebaseError(errMsg);
     } finally {
       setSyncing(false);
@@ -1463,59 +1450,6 @@ export default function App() {
     } finally {
       setSyncing(false);
     }
-  };
-
-  const handleConfigSubmit = (e) => {
-    e.preventDefault();
-    setFirebaseError(null);
-    try {
-      let rawInput = configInput.trim();
-      
-      // 1. If it contains a variable declaration, extract only the object literal portion.
-      // Otherwise, extract the first curly-braces block if there is one.
-      let jsonStr = rawInput;
-      const configObjMatch = rawInput.match(/(?:const|let|var)?\s*(?:firebaseConfig|config)\s*=\s*(\{[\s\S]*?\})/);
-      if (configObjMatch) {
-        jsonStr = configObjMatch[1];
-      } else {
-        const braceMatch = rawInput.match(/(\{[\s\S]*\})/);
-        if (braceMatch) {
-          jsonStr = braceMatch[1];
-        }
-      }
-
-      // 2. Remove JavaScript comments (both single-line // and multi-line /* ... */)
-      jsonStr = jsonStr.replace(/\/\*[\s\S]*?\*\/|([^\\:]|^)\/\/.*$/gm, '$1');
-
-      // 3. Wrap unquoted keys in double quotes
-      jsonStr = jsonStr.replace(/([{,]\s*)(\w+)\s*:/g, '$1"$2":');
-
-      // 4. Convert single-quoted values to double-quoted values
-      jsonStr = jsonStr.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, '"$1"');
-
-      // 5. Strip trailing commas
-      jsonStr = jsonStr.replace(/,\s*([}\]])/g, '$1');
-
-      const config = JSON.parse(jsonStr);
-      const res = initializeFirebase(config);
-      if (res.initialized) {
-        setFirebaseInitialized(true);
-        setFirebaseError(null);
-        setConfigInput("");
-      } else {
-        setFirebaseError(res.error || "Failed to initialize Firebase with the config provided.");
-      }
-    } catch (err) {
-      console.error("Config parsing error", err);
-      setFirebaseError("Failed to parse config. Please ensure you are pasting a valid configuration object (either as a JSON object, JavaScript object, or the script snippet from the Firebase console).");
-    }
-  };
-
-  const handleClearConfig = () => {
-    clearFirebaseConfig();
-    setFirebaseInitialized(false);
-    setUser(null);
-    setFirebaseError(null);
   };
 
   return (
@@ -1562,81 +1496,39 @@ export default function App() {
               </div>
             )}
 
-            {/* Content based on configuration and Auth status */}
-            {!firebaseInitialized ? (
-              // 1. Firebase Config Setup
-              <form onSubmit={handleConfigSubmit}>
-                <div style={{fontSize:12,color:"#aaa",lineHeight:1.6,fontFamily:"monospace",marginBottom:14}}>
-                  Firebase is not configured. Please paste your Firebase Web App configuration JSON or script snippet to activate the Cloud Gate:
+            {/* Content based on Auth status */}
+            {!user ? (
+              // 1. Google Sign-In Button
+              <div style={{textAlign:"center",padding:"10px 0"}}>
+                <div style={{fontSize:12,color:"#aaa",lineHeight:1.6,fontFamily:"monospace",marginBottom:24}}>
+                  Establish a secure Google authentication link to synchronize your player progress across devices automatically.
                 </div>
-                <textarea
-                  value={configInput}
-                  onChange={(e) => setConfigInput(e.target.value)}
-                  placeholder='{"apiKey": "AIzaSy...", "authDomain": "...", "projectId": "...", ...}'
-                  style={{width:"100%",height:110,background:"#02020a",border:"1px solid #ffffff15",borderRadius:5,padding:10,color:"#00e5ff",fontFamily:"monospace",fontSize:10,resize:"none",marginBottom:16,outline:"none"}}
-                  required
-                />
-                <button type="submit" style={{width:"100%",padding:"12px",background:"linear-gradient(135deg,#0055ff,#00e5ff)",border:"none",borderRadius:6,fontFamily:"monospace",fontSize:12,color:"#000",fontWeight:700,letterSpacing:2,cursor:"pointer"}}>
-                  INITIALIZE GATE
+                <button 
+                  onClick={handleGoogleSignIn}
+                  style={{
+                    width:"100%",
+                    padding:"14px",
+                    background:"linear-gradient(135deg,#0055ff,#00e5ff)",
+                    border:"none",
+                    borderRadius:6,
+                    fontFamily:"monospace",
+                    fontSize:12,
+                    color:"#000",
+                    fontWeight:700,
+                    letterSpacing:2,
+                    cursor:"pointer",
+                    display:"flex",
+                    alignItems:"center",
+                    justifyContent:"center",
+                    gap:10,
+                    boxShadow:"0 0 15px rgba(0,229,255,0.2)"
+                  }}
+                >
+                  <span style={{fontSize:16}}>🌐</span> LINK GOOGLE SYSTEM
                 </button>
-                <div style={{fontSize:9,color:"#444",marginTop:10,textAlign:"center",fontFamily:"monospace"}}>
-                  Credentials can also be set via .env files for local hosting.
-                </div>
-              </form>
-            ) : !user ? (
-              // 2. Authentication Form
-              <form onSubmit={handleAuthSubmit}>
-                <div style={{fontSize:12,color:"#aaa",lineHeight:1.6,fontFamily:"monospace",marginBottom:16}}>
-                  Firebase activated. Establish a system link to synchronize your player state across all platforms.
-                </div>
-                
-                <div style={{marginBottom:12}}>
-                  <label style={{display:"block",fontFamily:"monospace",fontSize:9,color:"#00e5ff88",marginBottom:4}}>PLAYER EMAIL</label>
-                  <input
-                    type="email"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    style={{width:"100%",padding:10,background:"#02020a",border:"1px solid #ffffff15",borderRadius:5,color:"#fff",fontSize:12,outline:"none"}}
-                    required
-                  />
-                </div>
-
-                <div style={{marginBottom:18}}>
-                  <label style={{display:"block",fontFamily:"monospace",fontSize:9,color:"#00e5ff88",marginBottom:4}}>ACCESS KEY (PASSWORD)</label>
-                  <input
-                    type="password"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    style={{width:"100%",padding:10,background:"#02020a",border:"1px solid #ffffff15",borderRadius:5,color:"#fff",fontSize:12,outline:"none"}}
-                    required
-                  />
-                </div>
-
-                <div style={{display:"flex",gap:10,marginBottom:18}}>
-                  <button 
-                    type="submit" 
-                    onClick={() => setAuthMode("login")}
-                    style={{flex:1,padding:"11px",background:authMode==="login"?"#00e5ff":"transparent",border:authMode==="login"?"none":"1px solid rgba(0,229,255,0.3)",borderRadius:5,fontFamily:"monospace",fontSize:11,color:authMode==="login"?"#000":"#00e5ff",fontWeight:700,cursor:"pointer",letterSpacing:1}}
-                  >
-                    LOG IN
-                  </button>
-                  <button 
-                    type="submit" 
-                    onClick={() => setAuthMode("register")}
-                    style={{flex:1,padding:"11px",background:authMode==="register"?"#00e5ff":"transparent",border:authMode==="register"?"none":"1px solid rgba(0,229,255,0.3)",borderRadius:5,fontFamily:"monospace",fontSize:11,color:authMode==="register"?"#000":"#00e5ff",fontWeight:700,cursor:"pointer",letterSpacing:1}}
-                  >
-                    CREATE LINK
-                  </button>
-                </div>
-
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",borderTop:"1px solid #ffffff0a",paddingTop:14}}>
-                  <button type="button" onClick={handleClearConfig} style={{background:"none",border:"none",color:"#555",fontFamily:"monospace",fontSize:9,cursor:"pointer",textDecoration:"underline"}}>
-                    Clear Firebase Settings
-                  </button>
-                </div>
-              </form>
+              </div>
             ) : (
-              // 3. Synced / Logged In State
+              // 2. Synced / Logged In State
               <div>
                 <div style={{padding:"14px",background:"rgba(0,229,255,0.04)",border:"1px solid rgba(0,229,255,0.15)",borderRadius:6,marginBottom:20}}>
                   <div style={{fontFamily:"monospace",fontSize:9,color:"#00e5ff88",marginBottom:2}}>STATUS</div>
@@ -1645,7 +1537,7 @@ export default function App() {
                   </div>
                   
                   <div style={{fontFamily:"monospace",fontSize:9,color:"#00e5ff88",marginTop:12,marginBottom:2}}>ACTIVE PLAYER</div>
-                  <div style={{fontFamily:"monospace",fontSize:12,color:"#fff",wordBreak:"break-all"}}>{user.email}</div>
+                  <div style={{fontFamily:"monospace",fontSize:12,color:"#fff",wordBreak:"break-all"}}>{user.email || user.displayName || "Google Player"}</div>
                   
                   <div style={{fontFamily:"monospace",fontSize:9,color:"#00e5ff88",marginTop:12,marginBottom:2}}>LAST CLOUD SYNC</div>
                   <div style={{fontFamily:"monospace",fontSize:11,color:"#aaa"}}>
