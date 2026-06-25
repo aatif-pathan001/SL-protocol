@@ -1469,14 +1469,32 @@ export default function App() {
     e.preventDefault();
     setFirebaseError(null);
     try {
-      let jsonStr = configInput.trim();
+      let rawInput = configInput.trim();
       
-      if (jsonStr.includes("firebaseConfig = {")) {
-        const start = jsonStr.indexOf("firebaseConfig = {") + 17;
-        const end = jsonStr.indexOf("};", start) + 1;
-        jsonStr = jsonStr.slice(start, end);
-        jsonStr = jsonStr.replace(/([a-zA-Z0-9]+):/g, '"$1":').replace(/'/g, '"');
+      // 1. If it contains a variable declaration, extract only the object literal portion.
+      // Otherwise, extract the first curly-braces block if there is one.
+      let jsonStr = rawInput;
+      const configObjMatch = rawInput.match(/(?:const|let|var)?\s*(?:firebaseConfig|config)\s*=\s*(\{[\s\S]*?\})/);
+      if (configObjMatch) {
+        jsonStr = configObjMatch[1];
+      } else {
+        const braceMatch = rawInput.match(/(\{[\s\S]*\})/);
+        if (braceMatch) {
+          jsonStr = braceMatch[1];
+        }
       }
+
+      // 2. Remove JavaScript comments (both single-line // and multi-line /* ... */)
+      jsonStr = jsonStr.replace(/\/\*[\s\S]*?\*\/|([^\\:]|^)\/\/.*$/gm, '$1');
+
+      // 3. Wrap unquoted keys in double quotes
+      jsonStr = jsonStr.replace(/([{,]\s*)(\w+)\s*:/g, '$1"$2":');
+
+      // 4. Convert single-quoted values to double-quoted values
+      jsonStr = jsonStr.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, '"$1"');
+
+      // 5. Strip trailing commas
+      jsonStr = jsonStr.replace(/,\s*([}\]])/g, '$1');
 
       const config = JSON.parse(jsonStr);
       const res = initializeFirebase(config);
@@ -1489,7 +1507,7 @@ export default function App() {
       }
     } catch (err) {
       console.error("Config parsing error", err);
-      setFirebaseError("Failed to parse config. Please make sure you are pasting a valid JSON object e.g. {\"apiKey\": \"...\", \"projectId\": \"...\"}");
+      setFirebaseError("Failed to parse config. Please ensure you are pasting a valid configuration object (either as a JSON object, JavaScript object, or the script snippet from the Firebase console).");
     }
   };
 
